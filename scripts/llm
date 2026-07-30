@@ -1,0 +1,150 @@
+#!/usr/bin/env bash
+# llm - Manage local llama.cpp server (LM Studio-like experience)
+# Usage: llm {start|stop|status|restart}
+
+set -euo pipefail
+
+CONTAINER_NAME="local-llm-server"
+MODEL_NAME="Qwen3.6-35B-A3B-Uncensored-HauhauCS-Aggressive-Q4_K_M.gguf"
+MODEL_PATH="/home/lain/Projects/AI/models/${MODEL_NAME}"
+HOST_PORT=4269
+API_URL="http://127.0.0.1:${HOST_PORT}"
+
+# Colors
+RED='\033[0;31m'
+GREEN='\033[0;32m'
+YELLOW='\033[0;33m'
+NC='\033[0m'
+
+usage() {
+    echo "Usage: $0 {start|stop|status|restart}"
+    echo ""
+    echo "Commands:"
+    echo "  start    - Start the LLM server in background"
+    echo "  stop     - Stop the LLM server"
+    echo "  status   - Check server status"
+    echo "  restart  - Restart the LLM server"
+    echo ""
+    echo "After starting, the server exposes an OpenAI-compatible API at:"
+    echo "  ${API_URL}/v1/chat/completions"
+    echo ""
+    echo "Test with:"
+    echo "  curl ${API_URL}/v1/chat/completions \\"
+    echo "    -H 'Content-Type: application/json' \\"
+    echo "    -d '{\"model\":\"${MODEL_NAME}\",\"messages\":[{\"role\":\"user\",\"content\":\"Hi\"}],\"max_tokens\":50}'"
+    exit 1
+}
+
+check_prereqs() {
+    if ! command -v podman &> /dev/null; then
+        echo -e "${RED}Error: podman is not installed${NC}"
+        exit 1
+    fi
+    if [ ! -f "/home/lain/Projects/AI/models/${MODEL_NAME}" ]; then
+        echo -e "${RED}Error: Model not found at ${MODEL_PATH}${NC}"
+        exit 1
+    fi
+}
+
+start_server() {
+    local running
+    running=$(podman ps --filter "name=${CONTAINER_NAME}" --format "{{.Status}}" 2>/dev/null || true)
+    if [ -n "$running" ]; then
+        echo -e "${YELLOW}Server is already running: ${running}${NC}"
+        return 0
+    fi
+
+    echo -n "Starting LLM server... "
+    
+    podman run -d \
+        --name "${CONTAINER_NAME}" \
+        --device nvidia.com/gpu=all \
+        --security-opt label=disable \
+        --ulimit memlock=-1:-1 \
+        -p "${HOST_PORT}:${HOST_PORT}" \
+        -v "/home/lain/Projects/AI/models:/models:z" \
+        ghcr.io/ggml-org/llama.cpp:full-cuda \
+        -s \
+        --host 0.0.0.0 \
+        --port ${HOST_PORT} \
+        -m /models/${MODEL_NAME} \
+        -np 1 --flash-attn on \
+        -ctk q8_0 -ctv q8_0 \
+        --fit on --fit-ctx 128000 --fit-target 256 \
+        --load-mode mlock -ub 2048
+
+    # Wait for server to be ready (check OpenAI endpoint)
+    for i in $(seq 1 60); do
+        if curl -s "${API_URL}/v1/models" 2>/dev/null | grep -q "object"; then
+            echo -e "${GREEN}ready!${NC}"
+            echo "Server running at ${API_URL}"
+            return 0
+        fi
+        sleep 2
+    done
+
+    echo -e "${RED}timed out waiting for server${NC}"
+    podman logs --tail 20 "${CONTAINER_NAME}"
+    return 1
+}
+
+stop_server() {
+    local container_id
+    container_id=$(podman ps --filter "name=${CONTAINER_NAME}" -q 2>/dev/null || true)
+    
+    if [ -z "$container_id" ]; then
+        echo -e "${YELLOW}Server is not running${NC}"
+        return 0
+    fi
+
+    echo "Stopping LLM server..."
+    podman stop "${CONTAINER_NAME}" 2>/dev/null
+    podman rm "${CONTAINER_NAME}" 2>/dev/null || true
+    echo -e "${GREEN}Server stopped${NC}"
+}
+
+status_server() {
+    local container_id status
+    container_id=$(podman ps --filter "name=${CONTAINER_NAME}" -q 2>/dev/null || true)
+    
+    if [ -z "$container_id" ]; then
+        echo -e "${YELLOW}LLM Server: stopped${NC}"
+        return 1
+    fi
+
+    status=$(podman ps --filter "name=${CONTAINER_NAME}" --format "{{.Status}}")
+    echo -e "${GREEN}LLM Server: running${NC}"
+    echo "  Status: ${status}"
+    echo "  API: ${API_URL}/v1/chat/completions"
+    echo ""
+    echo "Quick test:"
+    echo "  curl -s ${API_URL}/v1/models"
+    return 0
+}
+
+restart_server() {
+    stop_server
+    sleep 1
+    start_server
+}
+
+# Main
+case "${1:-}" in
+    start)
+        check_prereqs
+        start_server
+        ;;
+    stop)
+        stop_server
+        ;;
+    status)
+        status_server
+        ;;
+    restart)
+        check_prereqs
+        restart_server
+        ;;
+    *)
+        usage
+        ;;
+esac
